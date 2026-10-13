@@ -302,8 +302,9 @@ writes settings files on this computer only and needs no account.
 
 ## Known limitations
 
-- **macOS only.** The installer relies on `launchd`. `server.py` has no macOS-only code,
-  so on Linux you can run it from a `systemd --user` unit instead. Windows is not
+- **macOS only.** The installer and app are built for macOS. On Linux, run `server.py`
+  directly and configure a service manager such as `systemd --user` separately.
+  macOS features such as the Finder folder picker are unavailable. Windows is not
   supported yet ([#1](../../issues/1)).
 - **Plugin changes take effect from the next session.** Claude Code reads plugin state
   when a session starts.

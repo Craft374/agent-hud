@@ -271,8 +271,9 @@ Chrome과 Edge에서는 바로 설치된다. 이 기능이 없는 브라우저(S
 
 ## 한계
 
-- **macOS만 지원한다.** 설치 스크립트가 `launchd`를 쓰기 때문이다. `server.py`에는
-  macOS 전용 코드가 없어서, 리눅스에서는 `systemd --user` 유닛으로 돌리면 된다.
+- **macOS만 지원한다.** 설치 스크립트와 앱은 macOS용이다. Linux에서는 `server.py`를
+  직접 실행하고 `systemd --user` 같은 서비스 관리 도구를 별도로 설정해야 한다.
+  Finder 폴더 선택 같은 macOS 기능은 사용할 수 없다.
   Windows는 아직 지원하지 않는다([#1](../../issues/1)).
 - **플러그인을 켜고 끄면 다음 세션부터 적용된다.** Claude Code가 세션을 시작할 때
   플러그인 상태를 읽기 때문이다.
