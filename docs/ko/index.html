@@ -178,7 +178,7 @@ footer a:hover{color:var(--text)}
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "Agent HUD",
-  "description": "여기저기 흩어진 스킬과 플러그인을 한곳에서 보고, 프로젝트마다 쓰지 않는 것은 꺼둘 수 있습니다. 내 컴퓨터에서만 돌아갑니다.",
+  "description": "프로젝트별 스킬과 지침 파일을 확인하는 로컬 대시보드. Claude Code의 플러그인과 스킬을 프로젝트마다 켜고 끌 수 있습니다.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS",
   "url": "https://ganggangstone.github.io/agent-hud/ko/",
@@ -374,6 +374,11 @@ footer a:hover{color:var(--text)}
 </svg>
   </figure>
   <p class="small dim" style="max-width:34em;margin:22px auto 0">에이전트마다 스킬을 찾는 폴더가 다릅니다. 스킬의 체크박스를 선택하면 프로젝트의 .claude/skills/와 .agents/skills/에 원본 폴더를 가리키는 링크를 만듭니다. 수정은 원본 한 곳에서 합니다. 링크를 통한 읽기는 Claude Code, Codex, Gemini CLI, Copilot, Antigravity에서 확인했으며, Cursor는 아직 확인하지 않았습니다.</p>
+</section>
+
+<section class="w tell">
+  <p class="say col-n">같은 저장소의 worktree에 스킬을 공유합니다.</p>
+  <p class="small dim col-m" style="margin-top:16px">플러그인 &amp; 스킬에서 같은 저장소의 worktree를 펼치고, 스킬과 작업 폴더를 선택한 뒤 경로를 미리 확인합니다. 없는 스킬 링크만 추가하며 기존 폴더와 링크는 유지합니다. 플러그인 설정·훅·MCP 구성은 복사하지 않습니다. 새 worktree에 적용할 기본 구성을 저장할 수도 있습니다. HUD 실행 중에는 15초마다 확인하므로, 에이전트를 시작하기 전에 링크가 필요하면 <span class="mono">agent-hud worktrees apply</span>를 실행합니다. 자동 적용 제외와 세션 반영 방법은 <a href="https://github.com/ganggangstone/agent-hud/blob/main/README.ko.md#여러-프로젝트와-세션">README</a>에 있습니다.</p>
 </section>
 
 <section class="w tell">

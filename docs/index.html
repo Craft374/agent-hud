@@ -178,7 +178,7 @@ footer a:hover{color:var(--text)}
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "Agent HUD",
-  "description": "A local dashboard for the skills and plugins installed across your machine. See them in one place, and switch off the ones a project does not need.",
+  "description": "A local dashboard for project skills and instruction files. Enable or disable Claude Code plugins and skills per project.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "macOS",
   "url": "https://ganggangstone.github.io/agent-hud/",
@@ -375,6 +375,11 @@ footer a:hover{color:var(--text)}
 </svg>
   </figure>
   <p class="small dim" style="max-width:34em;margin:22px auto 0">Agents look for skills in different folders. Selecting a skill&#8217;s checkbox creates links to its original folder in the project&#8217;s .claude/skills/ and .agents/skills/ folders. You edit the original in one place. Reading through these links has been checked with Claude Code, Codex, Gemini CLI, Copilot and Antigravity; Cursor has not yet been checked.</p>
+</section>
+
+<section class="w tell">
+  <p class="say col-n">Share skills with worktrees in the same repository.</p>
+  <p class="small dim col-m" style="margin-top:16px">In Plugins &amp; skills, expand Worktrees in this repository, select skills and worktrees, and preview the paths before applying. This adds missing skill links; it preserves existing folders and links and does not copy plugin settings, hooks or MCP configuration. You can save a default for new worktrees. While HUD is running, it checks every 15 seconds; run <span class="mono">agent-hud worktrees apply</span> before starting an agent if you need the links in place first. See the <a href="https://github.com/ganggangstone/agent-hud#behavior-across-projects-and-sessions">README</a> for exclusions and session reload behavior.</p>
 </section>
 
 <section class="w tell">

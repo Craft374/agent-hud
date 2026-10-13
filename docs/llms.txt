@@ -11,6 +11,10 @@ Agent HUD shows how many skills a selected project loads, and lets you save the 
 skills you use together as a group and apply a different group per project.
 ON/OFF switches update Claude Code settings only. Skill linking and group
 changes also add or remove project skill links used by other agents.
+Worktree sharing adds missing skill links to selected checkouts of the same
+repository without copying plugin settings, hooks or MCP configuration. Saved
+defaults can apply to new worktrees every 15 seconds while HUD runs; use
+`agent-hud worktrees apply` before launching an agent to apply them first.
 It reads and writes settings files on the machine it runs on and needs no
 account. On its own it makes one request, a GitHub Releases check once a
 day for update notices; a Homebrew install can also update itself when the
