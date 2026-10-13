@@ -18,12 +18,12 @@
 </p>
 
 <p align="center">
-  <img src="docs/images/demo-ko.gif" alt="프로젝트에 app 그룹을 적용하면 스킬 60개(약 6,000토큰)가 6개로 줄어든다" width="880">
+  <img src="docs/images/demo-ko.gif" alt="예시: app 그룹을 적용해 프로젝트가 불러오는 스킬 수를 60개에서 6개로 줄인다" width="880">
 </p>
 
-Claude Code, Codex, Cursor 같은 코딩 에이전트는 세션을 시작할 때 설치된 스킬의 이름과
-설명을 전부 컨텍스트에 넣는다. 그 세션에서 쓰지 않는 스킬도 빠지지 않는다. 만든 사람의
-컴퓨터에서는 스킬 60개가 세션마다 5,000~9,000토큰을 차지했다.
+코딩 에이전트는 세션을 시작할 때 읽을 수 있는 스킬의 이름과 설명을 컨텍스트에 넣는다.
+그 세션에서 쓰지 않는 스킬 설명도 포함되어 입력 토큰이 낭비된다. 개발자의 컴퓨터에서는 스킬 60개의 이름과 설명이
+총 18,938자였고, 토큰 수는 약 5,000~9,000개로 추정했다.
 `claude plugin disable <플러그인> -s local`로 프로젝트마다 끌 수는 있지만 하나씩 꺼야 하고,
 스킬이 아직 몇 개 읽히는지는 보이지 않는다.
 
@@ -71,8 +71,8 @@ git clone https://github.com/ganggangstone/agent-hud.git agent-hud && cd agent-h
 ```
 
 설치 스크립트는 `server.py`를 `~/.claude/tools/agent-hud/`에 복사하고, `modes.json.example`을
-본떠 `modes.json`을 만들고, `launchd` 서비스로 등록한다. 그래서 터미널을 닫아도 대시보드는
-계속 돌고, 프로세스가 죽으면 다시 켜진다. Homebrew로 설치하면 `agent-hud` 명령이 생기고,
+본떠 `modes.json`을 만들고, `launchd` 서비스로 등록한다. 터미널을 닫아도 대시보드는
+계속 실행되며, 프로세스가 종료되면 다시 시작된다. Homebrew로 설치하면 `agent-hud` 명령이 생기고,
 같은 서버를 `brew services`가 띄운다.
 
 ## 화면 구성
@@ -91,7 +91,7 @@ git clone https://github.com/ganggangstone/agent-hud.git agent-hud && cd agent-h
   Claude Code용 켜짐/꺼짐 스위치가 있다.
 - **에이전트 지침**: 프로젝트 안의 `CLAUDE.md`, `AGENTS.md`, `.cursor/rules/` 같은
   지침 파일 30종을 찾아 크기와 수정 시각을 보여준다. `CLAUDE.md`는 고쳤는데
-  `AGENTS.md`는 그대로인 경우가 바로 보인다.
+  `AGENTS.md`는 그대로인지 수정 시각을 비교할 수 있다.
 
 ## 개념
 
@@ -150,8 +150,10 @@ Cursor 등은 `AGENTS.md`, Cursor는 `.cursor/rules/`, Copilot은
 
 ### 적용되는 에이전트
 
-그룹에 든 스킬은 모든 에이전트가 읽게 된다. 그룹에 없는 것을 끄는 건 Claude Code에만
-적용된다. 다른 에이전트에는 프로젝트마다 스킬을 끄는 설정이 없기 때문이다.
+그룹에 든 스킬은 지원하는 에이전트의 프로젝트 스킬 폴더에 연결된다. 그룹에 없는
+Agent HUD의 ON/OFF 스위치는 Claude Code 설정만 수정한다. 다른 에이전트의
+개별 스킬 활성화 설정은 관리하지 않는다. 다만 그룹을 바꾸면 프로젝트의 스킬 링크가
+추가되거나 삭제되므로 다른 에이전트가 찾는 스킬 목록도 달라질 수 있다.
 
 | | 그룹에 든 것 | 그룹에 없는 것 |
 |---|---|---|
@@ -186,7 +188,7 @@ python3 ~/.claude/tools/agent-hud/server.py apply --off     # 그룹 스킬의 �
 
 플러그인 이름은 플러그인 & 스킬 탭에 나온 이름과 `@마켓플레이스` 부분까지 같아야 한다.
 스킬 이름은 스킬 폴더 이름이다. 파일을 저장하면 대시보드가 다음 새로고침 때 읽으므로
-아무것도 다시 시작하지 않아도 된다.
+서버를 다시 시작할 필요는 없다.
 
 ## 여러 프로젝트와 세션
 
