@@ -77,7 +77,7 @@ nothing for users.
 - **`tests/test_install_app.py`** — `/manifest.json` and `/icon.png` are valid
   and the page actually links the manifest. Whether Chrome offers the install
   prompt for real can only be checked in a browser.
-- **`tests/test_mac_app.py`** — `app/` has a valid `Info.plist`, the Swift source, the icon and an executable `build.sh`. The app itself is built with `app/build.sh`.
+- **`tests/test_mac_app.py`** — `app/mac/` has a valid `Info.plist`, the Swift source, the icon and an executable `build.sh`. The app itself is built with `app/mac/build.sh`. The Windows app (`app/windows/agent_hud.py`) is built on Windows by the "윈도우 앱" Actions workflow.
 - **`tests/test_project_skill_source.py`** — a skill that lives only inside a registered
   project can be a group source, links are never taken as sources, plugin and user skills
   win name clashes, and the source project's real folder is left alone.

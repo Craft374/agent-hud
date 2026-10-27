@@ -36,6 +36,8 @@ PORT = int(os.environ.get("AGENT_HUD_PORT") or 41717)
 UPDATE_REPO = "ganggangstone/agent-hud"
 UPDATE_CACHE_FILE = os.path.join(TOOL_DIR, ".update_check.json")
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60
+# 창 없는 윈도우 앱에서 git·claude를 부를 때마다 콘솔 창이 번쩍이지 않게 한다. 맥에서는 0
+NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 # 세션 훅과 화면 폴링이 동시에 목록을 고친다. 잠그지 않으면 한쪽이 읽는 사이 다른 쪽이 쓰다 만 파일을
@@ -235,8 +237,8 @@ def start_in_background():
         subprocess.run([os.path.join(prefix, "bin", "brew"), "services", "start", "agent-hud"],
                        capture_output=True, timeout=120)
         return
-    subprocess.Popen([sys.executable] if FROZEN else [sys.executable, os.path.abspath(__file__)],
-                     start_new_session=True, creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
+    subprocess.Popen([sys.executable, os.path.abspath(__file__)], start_new_session=True,
+                     creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      env=dict(os.environ, AGENT_HUD_NO_BROWSER="1"))
 
@@ -780,7 +782,7 @@ def _git_read(path, *args):
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_OPTIONAL_LOCKS"] = "0"
     try:
-        p = subprocess.run(["git", "-C", path, *args], env=env,
+        p = subprocess.run(["git", "-C", path, *args], env=env, creationflags=NO_WINDOW,
                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3)
         return os.fsdecode(p.stdout) if p.returncode == 0 else None
     except (OSError, subprocess.TimeoutExpired):
@@ -1346,7 +1348,8 @@ def _claude(args, cwd=None, timeout=300):
         return None, "claude command not found"
     try:
         r = subprocess.run([exe, "plugin", *args], cwd=cwd, env=env, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+                           encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
+                           creationflags=NO_WINDOW)
     except Exception as e:
         return None, str(e)
     if r.returncode:
@@ -2242,6 +2245,8 @@ document.getElementById('installBtn').onclick = async (e) => {
   pop.classList.toggle('open');
 };
 document.addEventListener('click', (e) => { if(!e.target.closest('#installWrap')) closeInstallPop(); });
+// 윈도우 앱(WebView2) 창 안에서는 '앱으로 설치'가 필요 없다. 맥 앱은 앱 쪽에서 숨긴다.
+if(window.chrome && chrome.webview) document.getElementById('installWrap').style.display = 'none';
 const shortAgent = a => a.replace(' CLI','');
 const fmtTime = ts => new Date(ts*1000).toLocaleDateString(undefined,{month:'2-digit',day:'2-digit'}) + ' ' + new Date(ts*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
 const TITLE_MAP = { Groups: 'title_groups', 'Instructions & agents': 'title_instructions', 'Skills (who can see them)': 'title_skills' };
@@ -2424,6 +2429,7 @@ if(!('__loose__' in skillsOpen)) skillsOpen['__loose__'] = true;
 async function pickFolder(){
   const h = window.webkit && webkit.messageHandlers && webkit.messageHandlers.pickFolder;
   if(h) return {ok: true, path: await h.postMessage(null)};
+  if(window.pywebview) return {ok: true, path: await pywebview.api.pick_folder()};  // 윈도우 앱
   return await (await fetch('/api/pick-folder', {method:'POST'})).json();
 }
 function stateUrl(){
@@ -3597,9 +3603,7 @@ def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--register":
         PROJECT_DIR = os.path.abspath(sys.argv[2])
     registering = len(sys.argv) > 2 and sys.argv[1] == "--register"
-    # 윈도우 exe를 더블클릭했다. 떠 있으면 탭을 열고, 아니면 이 콘솔 창이 서버가 된다(창을 닫으면 꺼진다).
-    clicked = FROZEN and not argv
-    opening = clicked or (bool(argv) and argv[0] == "open")
+    opening = bool(argv) and argv[0] == "open"
     port = PORT
     url = f"http://127.0.0.1:{port}"
 
@@ -3620,10 +3624,9 @@ def main():
         except Exception:
             pass
 
-    if hud_alive(port):
-        return hand_off()
-
-    if opening and not clicked:
+    if opening:
+        if hud_alive(port):
+            return hand_off()
         # 꺼져 있으면 서버를 따로 띄우고, 응답할 때까지 기다렸다가 연다. 이 명령이 직접 서버가 되면
         # 터미널이나 에이전트의 셸을 붙잡고 끝나지 않고, 그 셸이 닫힐 때 대시보드도 같이 죽는다.
         start_in_background()
@@ -3635,9 +3638,8 @@ def main():
         print(f"agent-hud: the dashboard did not start. Is another program using port {port}?", file=sys.stderr)
         sys.exit(1)
 
-    if not clicked:  # 더블클릭한 exe의 cwd는 exe가 있는 폴더라 프로젝트가 아니다
-        register_project(PROJECT_DIR)
-    cleanup_known_projects()
+    # 떠 있는지 묻기 전에 포트부터 잡는다. 윈도우는 닫힌 포트에 연결하면 거절을 받기까지 1초쯤 걸려서,
+    # 먼저 물으면 앱이 뜰 때마다 그만큼 늦는다. 못 잡으면 그때 물어서 넘긴다.
     # 윈도우의 SO_REUSEADDR은 이미 쓰는 포트에도 붙게 해서, 아래의 "포트가 차 있으면 넘긴다"가 깨진다.
     socketserver.ThreadingTCPServer.allow_reuse_address = os.name != "nt"
     # 다른 프로그램이 이 포트를 쓰고 있으면 옆 번호로 가지 않는다(위 PORT 설명).
@@ -3656,13 +3658,13 @@ def main():
                       file=sys.stderr, flush=True)
                 warned = True
             time.sleep(30)
+    register_project(PROJECT_DIR)
+    cleanup_known_projects()
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
     threading.Thread(target=_worktree_apply_loop, daemon=True).start()
     if not os.environ.pop("AGENT_HUD_NO_BROWSER", None):
         webbrowser.open(url, new=0, autoraise=opening)
-    if clicked:
-        print(f"Agent HUD is running at {url}. Close this window to stop it.", flush=True)
     # keep process alive in background; parent hook detaches us
     while True:
         time.sleep(3600)

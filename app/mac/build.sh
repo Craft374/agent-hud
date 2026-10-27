@@ -11,7 +11,7 @@ rm -rf "$APP" && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -parse-as-library -target "$(uname -m)-apple-macos12.0" AgentHUD.swift -o "$APP/Contents/MacOS/AgentHUD"
 cp Info.plist "$APP/Contents/Info.plist"
 cp AppIcon.icns "$APP/Contents/Resources/"
-cp ../server.py "$APP/Contents/Resources/"
+cp ../../server.py "$APP/Contents/Resources/"
 codesign --force --sign - "$APP"
 echo "built: $PWD/$APP"
 if [ "${1:-}" = "--install" ]; then

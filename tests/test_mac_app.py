@@ -1,9 +1,9 @@
-"""app/ 의 Swift 앱 소스가 .app 으로 묶일 수 있는 모양인지 본다. 실제 빌드와 실행은 macOS에서
-   app/build.sh 로 직접 해 봐야 안다.
+"""app/mac/ 의 Swift 앱 소스가 .app 으로 묶일 수 있는 모양인지 본다. 실제 빌드와 실행은 macOS에서
+   app/mac/build.sh 로 직접 해 봐야 안다.
    python3 tests/test_mac_app.py"""
 import os, plistlib
 
-APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app")
+APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "app", "mac")
 
 
 def main():
