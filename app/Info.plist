@@ -5,12 +5,15 @@
   <key>CFBundleName</key><string>Agent HUD</string>
   <key>CFBundleDisplayName</key><string>Agent HUD</string>
   <key>CFBundleIdentifier</key><string>io.github.ganggangstone.agent-hud</string>
-  <key>CFBundleExecutable</key><string>agent-hud-launcher</string>
+  <key>CFBundleExecutable</key><string>AgentHUD</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.5.0</string>
   <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>11.0</string>
-  <key>LSUIElement</key><true/>
+  <key>LSMinimumSystemVersion</key><string>12.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSPrincipalClass</key><string>NSApplication</string>
+  <key>NSAppTransportSecurity</key>
+  <dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict>
 </plist>

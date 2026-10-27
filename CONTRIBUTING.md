@@ -77,9 +77,7 @@ nothing for users.
 - **`tests/test_install_app.py`** — `/manifest.json` and `/icon.png` are valid
   and the page actually links the manifest. Whether Chrome offers the install
   prompt for real can only be checked in a browser.
-- **`tests/test_mac_app.py`** — `packaging/Agent HUD.app` has a valid `Info.plist`,
-  its launcher is executable and runs `agent-hud open`, and the icon it names exists. The
-  `agent-hud-app` cask in the tap installs this folder from the release tarball.
+- **`tests/test_mac_app.py`** — `app/` has a valid `Info.plist`, the Swift source, the icon and an executable `build.sh`. The app itself is built with `app/build.sh`.
 - **`tests/test_project_skill_source.py`** — a skill that lives only inside a registered
   project can be a group source, links are never taken as sources, plugin and user skills
   win name clashes, and the source project's real folder is left alone.

@@ -271,7 +271,7 @@ def collect_groups(ctx):
                      + [{"name": sk, "kind": "skill", "on": skill_is_shared(project_dir, sk, sources[sk])} for sk in skills],
         })
     return {"title": "Groups", "groups": groups,
-            "all_plugins": sorted(installed), "all_skills": sorted(sources),
+            "all_plugins": sorted(project_plugin_names(project_dir)), "all_skills": sorted(sources),
             "assigned": assigned, "project_dir": project_dir, "known_projects": known_projects()}
 
 
@@ -394,6 +394,7 @@ def _list_skills(dir_path):
 
 
 READABLE_PATHS = set()  # populated by collect_instructions, checked by /api/content
+CREATABLE_PATHS = set()  # 아직 없는 지침 파일(행에 '만들기'가 뜨는 것). 저장하면 새로 만든다
 
 
 # 프로젝트 루트 기준 (경로, 이 파일을 읽는 도구). '/'로 끝나면 디렉터리를 훑는다.
@@ -440,6 +441,8 @@ def _file_row(label, path, tool="Claude Code"):
     st = os.stat(path) if exists else None
     if exists:
         READABLE_PATHS.add(path)
+    else:
+        CREATABLE_PATHS.add(path)
     return {
         "name": label,
         "exists": exists,
@@ -1177,7 +1180,10 @@ def collect_skills(ctx):
         return skill
 
     rows = []
+    mine = project_plugin_names(project_dir)
     for name, entries in installed.items():
+        if name not in mine:
+            continue
         entry = entries[0] if entries else {}
         install_path = entry.get("installPath", "")
         mp_name = name.split("@", 1)[1] if "@" in name else None
@@ -1187,8 +1193,16 @@ def collect_skills(ctx):
             # 플러그인 폴더 자체는 Claude Code만 읽는다. 그룹을 프로젝트에 링크했다면
             # 같은 이름이 스킬 폴더에도 있어 index 쪽 값이 이긴다.
             decorate(sk, ["Claude Code"])
+        scopes = []
+        for e in entries:
+            if e.get("scope") == "user" or not e.get("scope"):
+                scopes.append({"scope": "user"})
+            else:
+                scopes.append({"scope": e["scope"], "project": e.get("projectPath", ""),
+                               "here": e.get("projectPath") == project_dir})
         rows.append({
             "name": name,
+            "scopes": scopes,
             "section_state": _section_state(skills),
             "components": plugin_components(install_path),
             "version": entry.get("version", "?"),
@@ -1241,7 +1255,7 @@ def collect_instructions(ctx):
     for a in agents:
         READABLE_PATHS.add(a["path"])
     return {
-        "title": "Instructions & agents (read-only)",
+        "title": "Instructions & agents",
         "files": rows,
         "truncated": truncated,
         "agents": agents,
@@ -1250,18 +1264,125 @@ def collect_instructions(ctx):
     }
 
 
+EDIT_LIMIT = 200_000  # 이보다 큰 파일은 화면에서 고치지 않는다(잘린 채 저장되면 뒤쪽이 사라진다)
+
+
 def read_content(path):
     if path not in READABLE_PATHS:
         return None, "path not allowed"
     try:
+        if os.path.getsize(path) > EDIT_LIMIT:
+            return None, "file too large to show here"
         with open(path, encoding="utf-8") as f:
-            text = f.read(50_000)
-        return text, ""
+            return f.read(), ""
     except Exception as e:
         return None, str(e)
 
 
+def save_content(path, text):
+    """화면에서 고친 지침을 쓴다. 목록에 오른 파일(또는 만들 수 있다고 알려 준 자리)만 허용한다.
+    플러그인 폴더는 플러그인이 관리하므로 막는다. 심볼릭 링크는 가리키는 파일을 고쳐 링크를 지키고,
+    CRLF 파일은 CRLF로 돌려 쓴다."""
+    if not isinstance(text, str) or len(text) > EDIT_LIMIT:
+        return False, "text too large"
+    exists = os.path.isfile(path)
+    if not ((exists and path in READABLE_PATHS) or
+            (not exists and path in CREATABLE_PATHS and os.path.isdir(os.path.dirname(path)))):
+        return False, "path not allowed"
+    target = os.path.realpath(path)
+    if target.startswith(os.path.join(CLAUDE_DIR, "plugins") + os.sep):
+        return False, "plugin files are managed by the plugin"
+    try:
+        if exists:
+            if os.path.getsize(target) > EDIT_LIMIT:
+                return False, "file too large to edit here"
+            with open(target, "rb") as f:
+                if b"\r\n" in f.read():
+                    text = text.replace("\r\n", "\n").replace("\n", "\r\n")
+        tmp = f"{target}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+        if exists:
+            shutil.copymode(target, tmp)
+        os.replace(tmp, target)
+        CREATABLE_PATHS.discard(path)
+        READABLE_PATHS.add(path)
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+# 플러그인 설치와 삭제는 claude CLI에 맡긴다. 앱으로 띄우면 PATH가 짧으므로 흔한 자리를 덧붙여 찾는다.
+CLAUDE_BIN_DIRS = [os.path.join(HOME, ".local", "bin"), "/opt/homebrew/bin", "/usr/local/bin",
+                   os.path.join(CLAUDE_DIR, "local")]
+PLUGIN_ID = re.compile(r"^[\w.-]+@[\w.-]+$")
+_catalog = {"at": 0, "rows": []}
+
+
+def _claude(args, cwd=None, timeout=300):
+    env = dict(os.environ, PATH=os.pathsep.join(CLAUDE_BIN_DIRS + [os.environ.get("PATH", "")]))
+    exe = shutil.which("claude", path=env["PATH"])
+    if not exe:
+        return None, "claude command not found"
+    try:
+        r = subprocess.run([exe, "plugin", *args], cwd=cwd, env=env, capture_output=True, text=True,
+                           timeout=timeout, stdin=subprocess.DEVNULL)
+    except Exception as e:
+        return None, str(e)
+    if r.returncode:
+        tail = (r.stderr or r.stdout).strip().splitlines()
+        return None, tail[-1] if tail else f"exit {r.returncode}"
+    return r.stdout, ""
+
+
+def plugin_catalog(q, limit=30):
+    """설치할 수 있는 플러그인을 검색한다. 목록은 크므로(수천 개) 10분 캐시하고 일부만 돌려준다."""
+    if time.time() - _catalog["at"] > 600:
+        out, err = _claude(["list", "--available", "--json"], timeout=60)
+        if out is None:
+            return None, err
+        try:
+            _catalog["rows"] = json.loads(out).get("available", [])
+        except ValueError:
+            return None, "bad catalog"
+        _catalog["at"] = time.time()
+    have = known_plugin_names()
+    q = (q or "").strip().lower()
+    rows = [r for r in _catalog["rows"] if r.get("pluginId") not in have
+            and (not q or q in r.get("name", "").lower() or q in r.get("description", "").lower())]
+    rows.sort(key=lambda r: -(r.get("installCount") or 0))
+    return [{"id": r["pluginId"], "desc": (r.get("description") or "")[:140]} for r in rows[:limit]], ""
+
+
+def plugin_change(action, plugin, scope, project_dir):
+    """action: install | uninstall. scope: user(공용) | local(그 프로젝트 전용)."""
+    if scope not in ("user", "local", "project") or not PLUGIN_ID.match(plugin or "") \
+            or (action == "install" and scope == "project"):
+        return False, "bad request"
+    if action == "install":
+        if not any(r.get("pluginId") == plugin for r in _catalog["rows"]):
+            return False, "unknown plugin"
+    elif plugin not in known_plugin_names():
+        return False, "unknown plugin"
+    cwd = HOME
+    if scope != "user":
+        if not project_dir or not os.path.isdir(project_dir):
+            return False, "project not found"
+        cwd = project_dir
+    args = [action, plugin, "-s", scope] + (["-y"] if action == "install" else [])
+    out, err = _claude(args, cwd=cwd)
+    return out is not None, err
+
+
 PANELS = [collect_groups, collect_skills, collect_instructions, collect_update]
+
+
+def project_plugin_names(project_dir):
+    """이 프로젝트에서 쓸 수 있는 플러그인: 공용으로 깔린 것과 이 프로젝트 전용으로 깔린 것.
+    다른 프로젝트 전용으로만 깔린 것은 뺀다."""
+    installed = read_json(os.path.join(CLAUDE_DIR, "plugins", "installed_plugins.json")).get("plugins", {})
+    return {name for name, entries in installed.items()
+            if any(e.get("scope", "user") == "user" or e.get("projectPath") == project_dir for e in entries)}
 
 
 def known_plugin_names():
@@ -1411,6 +1532,26 @@ def modify_group(action, group, member, kind="plugin"):
     return write_sets(sets)
 
 
+def save_group(group, plugins, skills):
+    """그룹의 구성원을 통째로 바꾼다. 비우면 그룹을 지운다."""
+    group = (group or "").strip()
+    if not group:
+        return False, "set name required"
+    plugins, skills = list(plugins or []), list(skills or [])
+    if not all(isinstance(x, str) for x in plugins + skills):
+        return False, "bad request"
+    if any(m not in known_plugin_names() for m in plugins):
+        return False, "unknown plugin"
+    if any(m not in skill_sources(PROJECT_DIR) for m in skills):
+        return False, "unknown skill"
+    sets = read_sets()
+    if plugins or skills:
+        sets[group] = {"plugins": plugins, "skills": skills}
+    else:
+        sets.pop(group, None)
+    return write_sets(sets)
+
+
 def assign_set(name, project_dir):
     """세트를 프로젝트에 적용한다. 스킬 링크도 플러그인 on/off도 이 프로젝트에만 걸린다
     (플러그인은 settings.local.json의 enabledPlugins에 쓴다).
@@ -1547,7 +1688,7 @@ PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
 body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"SF Pro Text","Pretendard",Inter,sans-serif;margin:0;padding:0;-webkit-font-smoothing:antialiased}
 .page{display:flex;align-items:flex-start;max-width:1180px;margin:0 auto}
 .main{flex:1;min-width:0;padding:28px 28px 28px 18px}
-.sidebar{flex:0 0 220px;padding:28px 12px 28px 28px;position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
+.sidebar{flex:0 0 264px;padding:28px 12px 28px 28px;position:sticky;top:0;align-self:flex-start;max-height:100vh;overflow-y:auto;display:flex;flex-direction:column;gap:14px}
 .sb-list{display:flex;flex-direction:column;gap:14px;min-width:0}
 .sb-search{display:flex;align-items:center;gap:7px;border:1px solid var(--border);border-radius:8px;padding:7px 9px;background:var(--panel)}
 .sb-search svg{flex-shrink:0;color:var(--dim)}
@@ -1555,15 +1696,19 @@ body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,"SF Pro 
 .sb-search input::placeholder{color:var(--dim)}
 .sb-group{display:flex;flex-direction:column;gap:2px}
 .sb-label{font-size:10.5px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--dim);padding:4px 8px 2px}
-.sb-item{display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--text);position:relative}
+.sb-item{display:flex;align-items:flex-start;gap:8px;padding:8px 8px;border-radius:7px;cursor:pointer;font-size:13px;color:var(--text);position:relative}
 .sb-item:hover{background:var(--off-tint)}
 .sb-item.active{background:var(--accent-tint);color:var(--accent);font-weight:600}
 .sb-item.active::before{content:"";position:absolute;left:-11px;top:6px;bottom:6px;width:3px;border-radius:2px;background:var(--accent)}
 .sb-dot{width:6px;height:6px;border-radius:50%;background:var(--on);flex-shrink:0}
 .sb-dot.idle{background:var(--dim);opacity:.5}
-.sb-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-.sb-parent{color:var(--dim);font-size:11px;font-weight:400;flex-shrink:0}
-.sb-pin{margin-left:auto;background:none;border:0;padding:2px;color:var(--dim);cursor:pointer;opacity:0;flex-shrink:0;line-height:0}
+.sb-dot{margin-top:6px}
+.sb-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}
+.sb-name{overflow-wrap:anywhere;line-height:1.3}
+.sb-path{color:var(--dim);font-size:11px;font-weight:400;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sb-item.child{margin-left:16px;padding:5px 8px;font-size:12px}
+.sb-item.child .sb-dot{margin-top:5px}
+.sb-pin{margin-left:auto;margin-top:2px;background:none;border:0;padding:2px;color:var(--dim);cursor:pointer;opacity:0;flex-shrink:0;line-height:0}
 .sb-item:hover .sb-pin{opacity:1}
 .sb-item.active .sb-pin{opacity:1;color:var(--accent)}
 .sb-item.pinned .sb-pin{opacity:1;color:var(--accent)}
@@ -1653,6 +1798,33 @@ span.clickable:hover,div.skill-desc.clickable:hover{color:var(--accent)}
 .comp:hover{color:var(--text);border-bottom-color:var(--dim)}
 .tooltag{border:1px solid var(--border);color:var(--dim);padding:1px 7px;border-radius:999px;font-size:11px;white-space:nowrap;margin-left:8px}
 .tag{font-size:11px;color:var(--dim);font-family:ui-monospace,"SF Mono",Menlo,monospace;white-space:nowrap;font-variant-numeric:tabular-nums}
+.tag.scope-user{color:var(--on);background:var(--on-tint);padding:1px 6px;border-radius:5px}
+.tag.scope-local{color:var(--accent);background:var(--accent-tint);padding:1px 6px;border-radius:5px}
+.tag .x{cursor:pointer;margin-left:5px;opacity:.55}
+.tag .x:hover{opacity:1;color:#f04452}
+.editor{width:100%;box-sizing:border-box;min-height:280px;resize:vertical;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:8px;padding:10px;font:12px/1.55 ui-monospace,"SF Mono",Menlo,monospace;tab-size:2}
+.editor:focus{outline:2px solid var(--accent-tint);border-color:var(--accent)}
+.editbar{display:flex;align-items:center;gap:12px;margin-top:8px;font-size:12px}
+.editbar button,.modal button.go{font:inherit;font-size:12px;font-weight:600;padding:5px 12px;border-radius:7px;border:1px solid var(--border);background:var(--panel);color:var(--text);cursor:pointer}
+.editbar button.primary,.modal button.go{background:var(--accent);border-color:var(--accent);color:var(--bg)}
+.editbar button:disabled,.modal button.go:disabled{opacity:.5;cursor:default}
+.modal-back{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:flex-start;justify-content:center;padding-top:9vh;z-index:50}
+.modal-back.open{display:flex}
+.modal{width:min(620px,92vw);max-height:78vh;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--border);border-radius:14px;box-shadow:0 18px 60px rgba(0,0,0,.35);padding:18px}
+.modal h3{margin:0 0 12px;font-size:15px}
+.modal input[type=search],.modal input[type=text]{width:100%;box-sizing:border-box;font:inherit;font-size:13px;padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text)}
+.modal label.pick{display:flex;gap:8px;align-items:center;padding:6px 0;font-size:13px;cursor:pointer;overflow-wrap:anywhere}
+.modal .sec{font-size:11px;color:var(--dim);margin:12px 0 2px;letter-spacing:.08em;text-transform:uppercase}
+.modal .editbar button{font:inherit}
+.chips{display:flex;flex-wrap:wrap;gap:6px;padding:4px 0 10px}
+.chip{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 9px;border-radius:999px;background:var(--off-tint);color:var(--text)}
+.chip.skill{font-style:italic}
+.modal .scopes{display:flex;gap:16px;margin:10px 0;font-size:12px}
+.modal .results{overflow:auto;flex:1;min-height:80px}
+.modal .res{display:flex;gap:12px;align-items:flex-start;padding:9px 0;border-top:1px solid var(--border)}
+.modal .res .info{flex:1;min-width:0}
+.modal .res .nm{font-weight:600;font-size:13px;overflow-wrap:anywhere}
+.modal .res .ds{color:var(--dim);font-size:12px;margin-top:2px}
 .tag.danger{cursor:pointer}
 .tag.danger:hover{color:#f04452}
 .mono{font-family:ui-monospace,"SF Mono",Menlo,monospace}
@@ -1706,6 +1878,22 @@ span.clickable:hover,div.skill-desc.clickable:hover{color:var(--accent)}
     </span>
   </span>
 </div>
+<div class="modal-back" id="installModal"><div class="modal">
+  <h3 id="imTitle"></h3>
+  <input type="search" id="imQuery">
+  <div class="scopes"><label><input type="radio" name="imScope" value="user" checked> <span id="imScopeUser"></span></label>
+    <label><input type="radio" name="imScope" value="local"> <span id="imScopeLocal"></span></label></div>
+  <div class="results" id="imResults"></div>
+  <div class="editbar"><button id="imClose"></button></div>
+</div></div>
+<div class="modal-back" id="groupModal"><div class="modal">
+  <h3 id="gmTitle"></h3>
+  <input type="text" id="gmName" style="margin-bottom:8px">
+  <input type="search" id="gmFilter">
+  <div class="results" id="gmList"></div>
+  <div class="editbar"><button class="primary go" id="gmSave"></button><button id="gmCancel"></button>
+    <button id="gmDelete" style="margin-left:auto"></button></div>
+</div></div>
 <div class="note" id="updateBanner" style="margin-bottom:12px;display:none"></div>
 <div id="tabs" style="display:inline-flex;border:1px solid var(--border);border-radius:6px;overflow:hidden;margin-bottom:12px"></div>
 <div id="applyBanner" class="rule-note"></div>
@@ -1717,8 +1905,9 @@ span.clickable:hover,div.skill-desc.clickable:hover{color:var(--accent)}
 <script>
 const T = {
   en: {
-  wt_title: 'Worktrees in this repository',
-  wt_intro: 'Share selected skills without changing plugins, hooks, agents or settings. Existing folders and links are kept.',
+  wt_title: 'Share skills with other worktrees of this repository',
+  wt_more: 'Details',
+  wt_intro: 'A Git worktree is another folder checked out from the same repository. Skills set up in this folder are not there automatically; this connects the ones you pick. Plugins, hooks and settings are not touched.',
   wt_root_only: 'Select the repository checkout root to apply skills. Subfolder configurations stay local to that folder.',
   wt_query_failed: 'Could not read the Git worktree list.',
   wt_skills: 'Skills to share', wt_targets: 'Choose worktrees',
@@ -1756,16 +1945,11 @@ const T = {
     assign_confirm: (g, p, pl, sk) => `Apply group "${g}" to this project?\n\n${p}\n\n${sk} skills are linked here.\nPlugins on: ${pl}\nEvery other plugin, and every skill not in the group, is turned off, in this project only.`,
     unassign_confirm: (g, p) => `Stop using "${g}" here?\n\n${p}\n\nIts skill links are removed. Plugins and skills stay on or off as they are.`,
     kind_plugin: 'plugin', kind_skill: 'skill',
-    add_member_ph: '+ add a plugin or skill…',
     member_plugin_tip: 'On in this project',
     member_skill_tip: 'Linked into this project',
     assign_failed: 'Could not apply that group: ',
     on: 'ON', off: 'OFF',
-    remove: 'remove ✕', remove_tip: (m,g) => `take ${m} out of "${g}"`,
-    remove_confirm: (m,g) => `Remove ${m} from group "${g}"?`,
     new_group: '+ create a new group', new_group_tip: 'Plugins and skills you switch on together. For example one set for coding, one for video work',
-    new_group_name_prompt: 'Name for the new group (e.g. "dev", "video"):',
-    new_group_first_prompt: 'Which plugin should it start with?\n',
     groups_legend: 'The plugins and skills you use together. Applying one sets up that project and leaves the others alone.',
   not_found: 'not found',
   agents_note: '.claude/agents/*.md · Cursor and Copilot read the same folder',
@@ -1785,9 +1969,9 @@ const T = {
   add_project_failed: 'Could not add that folder: ',
   no_project_yet: 'no folders yet',
   sidebar_search_ph: 'Search folders…',
-  sidebar_favorites: 'Favorites', sidebar_recent: 'Recent', sidebar_all: 'All',
+  sidebar_favorites: 'Pinned', sidebar_all: 'All',
   sidebar_no_match: 'No folder matches that search',
-  pin_tip: 'Pin to favorites', unpin_tip: 'Remove from favorites',
+  pin_tip: 'Pin to the top', unpin_tip: 'Unpin',
   forget_tip: 'Remove from this list',
   forget_confirm: p => `Remove this folder from the list?\n\n${p}\n\nThe folder and its settings stay as they are. It comes back when you run an agent session there.`,
   install_app: 'Install app',
@@ -1806,6 +1990,24 @@ const T = {
   },
   scan_truncated: 'This project is large, so the scan stopped early. Some instruction files further down may be missing.',
     no_subagents: 'No subagents',
+    edit_save: 'Save', edit_saved: 'Saved', edit_saving: 'Saving…', edit_revert: 'Revert', edit_unsaved: 'Unsaved changes',
+    edit_hint: '⌘S to save', edit_create_hint: 'This file does not exist yet. Saving creates it.',
+    edit_discard: 'Discard your unsaved changes?', edit_failed: 'Could not save: ',
+    scope_user: 'Shared', scope_user_tip: 'Installed for every project',
+    scope_here: 'This project only', scope_here_tip: 'Installed only for this project (local)',
+    scope_other: n => 'Only: ' + n, scope_other_tip: 'Installed only for another project (local)',
+    uninstall_tip: 'Uninstall this plugin',
+    uninstall_confirm: (n, sc) => `Uninstall ${n} (${sc})?`, uninstall_failed: 'Uninstall failed: ',
+    install_open: '+ Install plugin', install_title: 'Install a plugin', install_search_ph: 'Search plugins…',
+    install_scope_user: 'Shared (all projects)', install_scope_local: 'This project only',
+    install_btn: 'Install', installing: 'Installing…', install_failed: 'Install failed: ',
+    install_none: 'No plugins match', install_loading: 'Loading the plugin list…', install_close: 'Close',
+    group_new_title: 'New group', group_edit: 'Edit', group_edit_title: n => 'Edit group: ' + n,
+    group_name_ph: 'Group name (e.g. dev, video)', group_filter_ph: 'Search plugins and skills…',
+    group_save: 'Save', group_cancel: 'Cancel', group_delete: 'Delete group',
+    group_delete_confirm: n => `Delete the group "${n}"? Plugins and skills themselves are not touched.`,
+    group_need_name: 'Enter a group name', group_need_member: 'Pick at least one plugin or skill',
+    group_empty: 'Empty. Press Edit to pick plugins and skills.',
     loading: 'loading…', error: 'error: ',
     toggle_failed: 'Could not switch that plugin: ', group_update_failed: 'Could not change the group: ',
     plugin_on_tip: 'On in this project. Click to turn it off (next session)',
@@ -1830,8 +2032,9 @@ const T = {
     feedback_open: 'send feedback ↗',
   },
   ko: {
-  wt_title: '같은 저장소의 worktree',
-  wt_intro: '선택한 스킬만 공유합니다. 기존 폴더·링크와 플러그인·훅·에이전트·설정은 유지됩니다.',
+  wt_title: '같은 저장소의 다른 폴더(worktree)에 스킬 공유',
+  wt_more: '자세히',
+  wt_intro: 'worktree는 같은 저장소를 다른 폴더에 따로 펼친 작업 공간입니다. 이 폴더에 설정한 스킬은 그쪽에 자동으로 없으므로, 고른 스킬을 연결해 줍니다. 플러그인·훅·설정은 건드리지 않습니다.',
   wt_root_only: '스킬을 적용하려면 저장소의 worktree 루트를 선택하세요. 하위 폴더의 구성은 그 폴더에만 적용됩니다.',
   wt_query_failed: 'Git worktree 목록을 읽지 못했습니다.',
   wt_skills: '공유할 스킬', wt_targets: 'worktree 선택',
@@ -1869,16 +2072,11 @@ const T = {
     assign_confirm: (g, p, pl, sk) => `"${g}" 그룹을 이 프로젝트에 적용할까요?\n\n${p}\n\n스킬 ${sk}개가 여기 걸립니다.\n켜지는 플러그인: ${pl}\n나머지 플러그인과 그룹에 없는 스킬은 꺼집니다. 이 프로젝트에서만요.`,
     unassign_confirm: (g, p) => `"${g}" 적용을 풀까요?\n\n${p}\n\n스킬 링크만 지웁니다. 플러그인과 스킬이 켜지고 꺼진 상태는 그대로 둡니다.`,
     kind_plugin: '플러그인', kind_skill: '스킬',
-    add_member_ph: '+ 플러그인 또는 스킬 추가…',
     member_plugin_tip: '이 프로젝트에서 켜짐',
     member_skill_tip: '이 프로젝트에 걸려 있음',
     assign_failed: '그룹을 적용하지 못했습니다: ',
     on: '켜짐', off: '꺼짐',
-    remove: '빼기 ✕', remove_tip: (m,g) => `"${g}" 그룹에서 ${m} 빼기`,
-    remove_confirm: (m,g) => `"${g}" 그룹에서 ${m} 뺄까요?`,
     new_group: '+ 새 그룹 만들기', new_group_tip: '함께 쓰는 플러그인과 스킬을 묶어둡니다. 예를 들어 개발용, 영상제작용',
-    new_group_name_prompt: '새 그룹 이름 (예: "개발", "영상제작"):',
-    new_group_first_prompt: '어떤 플러그인부터 넣을까요?\n',
     groups_legend: '함께 쓰는 플러그인과 스킬을 묶어둔 것입니다. 프로젝트에 적용하면 그 프로젝트만 바뀌고 나머지는 그대로입니다.',
   not_found: '없음',
   agents_note: '.claude/agents/*.md · Cursor와 Copilot도 같은 폴더를 읽습니다',
@@ -1898,9 +2096,9 @@ const T = {
   add_project_failed: '폴더를 추가하지 못했습니다: ',
   no_project_yet: '아직 폴더가 없습니다',
   sidebar_search_ph: '폴더 검색…',
-  sidebar_favorites: '즐겨찾기', sidebar_recent: '최근 사용', sidebar_all: '전체',
+  sidebar_favorites: '고정', sidebar_all: '전체',
   sidebar_no_match: '검색 결과가 없습니다',
-  pin_tip: '즐겨찾기에 추가', unpin_tip: '즐겨찾기에서 제거',
+  pin_tip: '맨 위에 고정', unpin_tip: '고정 해제',
   forget_tip: '목록에서 빼기',
   forget_confirm: p => `이 폴더를 목록에서 뺄까요?\n\n${p}\n\n폴더와 그 안의 설정은 그대로 둡니다. 그 폴더에서 에이전트 세션을 열면 다시 나타납니다.`,
   install_app: '앱으로 설치',
@@ -1919,6 +2117,24 @@ const T = {
   },
   scan_truncated: '프로젝트가 커서 탐색을 중간에 멈췄습니다. 더 아래에 있는 지침 파일은 빠졌을 수 있습니다.',
     no_subagents: '서브에이전트 없음',
+    edit_save: '저장', edit_saved: '저장됨', edit_saving: '저장 중…', edit_revert: '되돌리기', edit_unsaved: '저장하지 않은 변경',
+    edit_hint: '⌘S로 저장', edit_create_hint: '아직 없는 파일입니다. 저장하면 새로 만듭니다.',
+    edit_discard: '저장하지 않은 변경을 버릴까요?', edit_failed: '저장하지 못했습니다: ',
+    scope_user: '공용', scope_user_tip: '모든 프로젝트에 설치됨',
+    scope_here: '이 프로젝트 전용', scope_here_tip: '이 프로젝트에만 설치됨 (로컬)',
+    scope_other: n => '전용: ' + n, scope_other_tip: '다른 프로젝트에만 설치됨 (로컬)',
+    uninstall_tip: '이 플러그인 삭제',
+    uninstall_confirm: (n, sc) => `${n} (${sc})을(를) 삭제할까요?`, uninstall_failed: '삭제하지 못했습니다: ',
+    install_open: '+ 플러그인 설치', install_title: '플러그인 설치', install_search_ph: '플러그인 검색…',
+    install_scope_user: '공용 (모든 프로젝트)', install_scope_local: '이 프로젝트 전용',
+    install_btn: '설치', installing: '설치 중…', install_failed: '설치하지 못했습니다: ',
+    install_none: '맞는 플러그인이 없습니다', install_loading: '플러그인 목록을 불러오는 중…', install_close: '닫기',
+    group_new_title: '새 그룹', group_edit: '편집', group_edit_title: n => '그룹 편집: ' + n,
+    group_name_ph: '그룹 이름 (예: 개발, 영상제작)', group_filter_ph: '플러그인·스킬 검색…',
+    group_save: '저장', group_cancel: '취소', group_delete: '그룹 삭제',
+    group_delete_confirm: n => `"${n}" 그룹을 삭제할까요? 플러그인과 스킬 자체는 그대로입니다.`,
+    group_need_name: '그룹 이름을 입력해 주세요', group_need_member: '플러그인이나 스킬을 하나 이상 골라 주세요',
+    group_empty: '비어 있습니다. 편집을 눌러 플러그인과 스킬을 고르세요.',
     loading: '불러오는 중…', error: '오류: ',
     toggle_failed: '켜고 끄지 못했습니다: ', group_update_failed: '그룹을 바꾸지 못했습니다: ',
     plugin_on_tip: '이 프로젝트에서 켜져 있습니다. 누르면 꺼집니다 (다음 세션부터)',
@@ -1968,7 +2184,8 @@ renderLangToggle();
 document.getElementById('applyBanner').innerHTML = t().banner;
 document.getElementById('h1sub').textContent = t().tagline;
 
-let theme = localStorage.getItem('agent-hud-theme') || 'dark';
+const darkMedia = matchMedia('(prefers-color-scheme: dark)');
+let theme = localStorage.getItem('agent-hud-theme') || (darkMedia.matches ? 'dark' : 'light');
 function renderTheme(){
   document.documentElement.setAttribute('data-theme', theme);
   document.getElementById('themeLight').classList.toggle('active', theme === 'light');
@@ -1979,6 +2196,7 @@ function setTheme(th){
   localStorage.setItem('agent-hud-theme', theme);
   renderTheme();
 }
+darkMedia.addEventListener('change', e => { if(!localStorage.getItem('agent-hud-theme')){ theme = e.matches ? 'dark' : 'light'; renderTheme(); } });
 document.getElementById('themeLight').onclick = () => setTheme('light');
 document.getElementById('themeDark').onclick = () => setTheme('dark');
 renderTheme();
@@ -2004,10 +2222,10 @@ document.getElementById('installBtn').onclick = async (e) => {
 document.addEventListener('click', (e) => { if(!e.target.closest('#installWrap')) closeInstallPop(); });
 const shortAgent = a => a.replace(' CLI','');
 const fmtTime = ts => new Date(ts*1000).toLocaleDateString(undefined,{month:'2-digit',day:'2-digit'}) + ' ' + new Date(ts*1000).toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'});
-const TITLE_MAP = { Groups: 'title_groups', 'Instructions & agents (read-only)': 'title_instructions', 'Skills (who can see them)': 'title_skills' };
-const TABS = ['Groups', 'Skills (who can see them)', 'Instructions & agents (read-only)'];
+const TITLE_MAP = { Groups: 'title_groups', 'Instructions & agents': 'title_instructions', 'Skills (who can see them)': 'title_skills' };
+const TABS = ['Skills (who can see them)', 'Groups', 'Instructions & agents'];
 // ?tab= 이 있으면 그걸 쓴다. 특정 탭을 링크로 걸거나 캡처할 때 필요하다.
-let activeTab = new URLSearchParams(location.search).get('tab') || localStorage.getItem('agent-hud-tab') || 'Groups';
+let activeTab = new URLSearchParams(location.search).get('tab') || localStorage.getItem('agent-hud-tab') || 'Skills (who can see them)';
 // 탭 이름이 바뀌면 저장된 값이 어느 패널과도 안 맞아 빈 화면이 된다.
 if(!TABS.includes(activeTab)) activeTab = TABS[0];
 function renderTabs(){
@@ -2026,7 +2244,8 @@ let polling = true;
 // tick()은 polling=false면 즉시 반환한다(파일 내용을 펼쳐두면 그렇게 된다).
 // 사용자가 직접 일으킨 재렌더는 그 가드를 넘어가야 한다 -- 재렌더가 열린 박스를
 // 어차피 지우므로 여기서 polling도 같이 되살린다.
-function rerender(){ polling = true; return tick(); }
+let lastKey = '';
+function rerender(){ polling = true; lastKey = ''; return tick(); }
 let selectedProject = localStorage.getItem('agent-hud-project') || '';
 let currentProjectDir = '';
 const contentCache = {};
@@ -2036,7 +2255,6 @@ let worktreeOpen = false;
 // 서버 쪽 파일을 늘리지 않아도 되고, 기기별로 다른 즐겨찾기를 갖는 게 오히려 자연스럽다.
 function readJSON(key, fallback){ try{ return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch(e){ return fallback; } }
 let favorites = readJSON('agent-hud-favorites', []);
-let recents = readJSON('agent-hud-recents', {});
 function saveFavorites(){ localStorage.setItem('agent-hud-favorites', JSON.stringify(favorites)); }
 function toggleFavorite(path){
   favorites = favorites.includes(path) ? favorites.filter(p => p !== path) : [...favorites, path];
@@ -2047,21 +2265,14 @@ async function forgetProject(path){
   try{ await fetch('/api/unregister', {method:'POST', body: JSON.stringify({path})}); }
   catch(e){ alert(t().error + e); return; }
   favorites = favorites.filter(p => p !== path); saveFavorites();
-  delete recents[path]; localStorage.setItem('agent-hud-recents', JSON.stringify(recents));
   if(selectedProject === path){ selectedProject = ''; localStorage.removeItem('agent-hud-project'); }
   await tick();
 }
 function chooseProject(path){
   selectedProject = path; localStorage.setItem('agent-hud-project', path);
-  recents[path] = Date.now();
-  // 화면엔 최근 5개만 보이므로(renderSidebarList) 저장도 5개로 자른다 -- 안 그러면
-  // 연 적 있는 프로젝트 전부가 지워지지 않고 계속 쌓인다.
-  recents = Object.fromEntries(Object.entries(recents).sort((a, b) => b[1] - a[1]).slice(0, 5));
-  localStorage.setItem('agent-hud-recents', JSON.stringify(recents));
   rerender();
 }
 function baseName(p){ return (p||'').split('/').filter(Boolean).pop() || p; }
-function parentName(p){ const parts = (p||'').split('/').filter(Boolean); return parts.length > 1 ? parts[parts.length - 2] : ''; }
 let sidebarQuery = '';
 let lastPanels = null;
 // 프로젝트 선택기. 사이드바 하나가 모든 탭을 대표한다 -- 예전엔 탭마다 드롭다운을 복제해 갖고 있었다.
@@ -2096,57 +2307,67 @@ function renderSidebarList(){
   const list = (p && p.known_projects) || [];
   const q = sidebarQuery.trim().toLowerCase();
   const matches = pr => !q || pr.toLowerCase().includes(q);
-  // 이름이 같은 폴더가 둘 이상이면(예: 여러 워크스페이스의 build/) 상위 폴더명을 옆에 붙인다.
-  const nameCounts = {};
-  for(const pr of list) nameCounts[baseName(pr)] = (nameCounts[baseName(pr)] || 0) + 1;
+  // 다른 프로젝트 안에 있는 폴더(모노레포의 하위 프로젝트 등)는 목록에 따로 쌓지 않고 그 아래 들여써 붙인다.
+  const parentOf = pr => list.filter(o => o !== pr && pr.startsWith(o + '/')).sort((x, y) => y.length - x.length)[0];
+  const childrenOf = {};
+  for(const pr of list){ const o = parentOf(pr); if(o) (childrenOf[o] = childrenOf[o] || []).push(pr); }
+  const tilde = pr => pr.replace(/^\/(Users|home)\/[^/]+/, '~');
 
   function group(labelKey, paths){
-    const shown = paths.filter(matches);
+    const shown = paths.filter(pr => !parentOf(pr)).filter(pr => matches(pr) || (childrenOf[pr] || []).some(matches));
     if(!shown.length) return;
     const g = document.createElement('div'); g.className = 'sb-group';
     const label = document.createElement('div'); label.className = 'sb-label'; label.textContent = t()[labelKey];
     g.appendChild(label);
-    for(const path of shown){
+    const row = (path, child) => {
       const it = document.createElement('div');
-      it.className = 'sb-item' + (path === p.project_dir ? ' active' : '') + (favorites.includes(path) ? ' pinned' : '');
+      it.className = 'sb-item' + (child ? ' child' : '') + (path === p.project_dir ? ' active' : '') + (favorites.includes(path) ? ' pinned' : '');
       it.title = path;
       const dot = document.createElement('span'); dot.className = 'sb-dot' + (path === p.project_dir ? '' : ' idle');
-      const name = document.createElement('span'); name.className = 'sb-name'; name.textContent = baseName(path);
-      it.appendChild(dot); it.appendChild(name);
-      if(nameCounts[baseName(path)] > 1){
-        const parent = document.createElement('span'); parent.className = 'sb-parent'; parent.textContent = parentName(path);
-        it.appendChild(parent);
+      const text = document.createElement('span'); text.className = 'sb-text';
+      const name = document.createElement('span'); name.className = 'sb-name';
+      name.textContent = child ? path.slice(parentOf(path).length + 1) : baseName(path);
+      text.appendChild(name);
+      if(!child){
+        const sub = document.createElement('span'); sub.className = 'sb-path'; sub.textContent = tilde(path.slice(0, path.lastIndexOf('/')) || '/');
+        text.appendChild(sub);
       }
-      const pin = document.createElement('button'); pin.className = 'sb-pin';
-      pin.title = favorites.includes(path) ? t().unpin_tip : t().pin_tip;
-      pin.innerHTML = favorites.includes(path)
-        ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.6 6.6L21 9.3l-5 4.6L17.3 21 12 17.6 6.7 21 8 13.9l-5-4.6 6.4-.7L12 2z"/></svg>'
-        : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l2.6 6.6L21 9.3l-5 4.6L17.3 21 12 17.6 6.7 21 8 13.9l-5-4.6 6.4-.7L12 2z"/></svg>';
-      pin.onclick = (e) => { e.stopPropagation(); toggleFavorite(path); };
-      it.appendChild(pin);
+      it.appendChild(dot); it.appendChild(text);
+      if(!child){
+        const pin = document.createElement('button'); pin.className = 'sb-pin';
+        pin.title = favorites.includes(path) ? t().unpin_tip : t().pin_tip;
+        pin.innerHTML = favorites.includes(path)
+          ? '<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l2.6 6.6L21 9.3l-5 4.6L17.3 21 12 17.6 6.7 21 8 13.9l-5-4.6 6.4-.7L12 2z"/></svg>'
+          : '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l2.6 6.6L21 9.3l-5 4.6L17.3 21 12 17.6 6.7 21 8 13.9l-5-4.6 6.4-.7L12 2z"/></svg>';
+        pin.onclick = (e) => { e.stopPropagation(); toggleFavorite(path); };
+        it.appendChild(pin);
+      }
       const rm = document.createElement('button'); rm.className = 'sb-pin sb-rm';
       rm.title = t().forget_tip; rm.textContent = '×';
       rm.onclick = (e) => { e.stopPropagation(); forgetProject(path); };
       it.appendChild(rm);
       it.onclick = () => chooseProject(path);
       g.appendChild(it);
+    };
+    for(const path of shown){
+      row(path, false);
+      for(const c of (childrenOf[path] || []).filter(c => !q || matches(c) || matches(path))) row(c, true);
     }
     listWrap.appendChild(g);
   }
 
-  const pinned = list.filter(pr => favorites.includes(pr));
-  const recent = list.filter(pr => !favorites.includes(pr) && recents[pr])
-    .sort((a, b) => (recents[b]||0) - (recents[a]||0)).slice(0, 5);
-  const rest = list.filter(pr => !favorites.includes(pr) && !recent.includes(pr));
+  // 순서는 늘 같다: 고정한 것(고정한 순서) 다음에 나머지를 이름순으로. 쓴다고 위치가 바뀌지 않는다.
+  const byName = (a, b) => baseName(a).localeCompare(baseName(b)) || a.localeCompare(b);
+  const pinned = favorites.filter(pr => list.includes(pr));
+  const rest = list.filter(pr => !favorites.includes(pr)).sort(byName);
 
   group('sidebar_favorites', pinned);
-  group('sidebar_recent', recent);
   group('sidebar_all', rest);
 
   if(!list.length){
     const empty = document.createElement('div'); empty.className = 'sb-empty'; empty.textContent = t().no_project_yet;
     listWrap.appendChild(empty);
-  } else if(q && !pinned.some(matches) && !recent.some(matches) && !rest.some(matches)){
+  } else if(q && !pinned.some(matches) && !rest.some(matches)){
     const empty = document.createElement('div'); empty.className = 'sb-empty'; empty.textContent = t().sidebar_no_match;
     listWrap.appendChild(empty);
   }
@@ -2157,7 +2378,7 @@ function renderSidebarList(){
     polling = false;
     let path = '';
     try{
-      const p = await (await fetch('/api/pick-folder', {method:'POST'})).json();
+      const p = await pickFolder();
       path = p.ok ? p.path : (prompt(t().add_project_prompt) || '').trim();
     } catch(e){ path = (prompt(t().add_project_prompt) || '').trim(); }
     if(!path){ polling = true; return; }
@@ -2177,6 +2398,12 @@ const skillsOpen = Object.fromEntries((new URLSearchParams(location.search).get(
   .split(',').filter(Boolean).map(k => [k, true]));
 // 플러그인 밖의 스킬은 펼친 채로 시작한다. 보통 몇 개뿐이고, 접어두면 있는 줄도 모른다.
 if(!('__loose__' in skillsOpen)) skillsOpen['__loose__'] = true;
+// 앱 안에서는 네이티브 폴더 창이 바로 뜬다. 브라우저에서는 서버가 osascript로 띄운다(몇 초 걸린다).
+async function pickFolder(){
+  const h = window.webkit && webkit.messageHandlers && webkit.messageHandlers.pickFolder;
+  if(h) return {ok: true, path: await h.postMessage(null)};
+  return await (await fetch('/api/pick-folder', {method:'POST'})).json();
+}
 function stateUrl(){
   return '/api/state' + (selectedProject ? ('?project=' + encodeURIComponent(selectedProject)) : '');
 }
@@ -2194,6 +2421,156 @@ async function showContent(path, box, caretEl){
   box.textContent = contentCache[path];
   box.classList.add('open');
 }
+// 지침 편집기. 파일 행을 펼치면 바로 고칠 수 있다. 열려 있는 동안은 polling이 꺼져 있어
+// (showContent와 같다) 갱신이 편집 중인 글을 지우지 못한다.
+async function showEditor(path, box, caret){
+  const closedCaret = caret.dataset.closed ?? (caret.dataset.closed = caret.textContent);
+  if(box.classList.contains('open')){
+    if(box._dirty && !confirm(t().edit_discard)) return;
+    box.classList.remove('open'); box._dirty = false; polling = true; caret.textContent = closedCaret; return;
+  }
+  polling = false; caret.textContent = '▾ ';
+  box.classList.add('open'); box.style.maxHeight = 'none'; box.style.whiteSpace = 'normal'; box.textContent = t().loading;
+  let d;
+  try{ d = await (await fetch('/api/content?path=' + encodeURIComponent(path))).json(); }
+  catch(e){ d = {ok: false, error: String(e)}; }
+  if(!d.ok){ box.style.whiteSpace = 'pre-wrap'; box.textContent = t().error + d.error; return; }
+  box.textContent = '';
+  const ta = document.createElement('textarea'); ta.className = 'editor'; ta.spellcheck = false; ta.value = d.text;
+  const bar = document.createElement('div'); bar.className = 'editbar';
+  const save = document.createElement('button'); save.className = 'primary'; save.textContent = t().edit_save; save.disabled = true;
+  const revert = document.createElement('button'); revert.textContent = t().edit_revert; revert.disabled = true;
+  const status = document.createElement('span'); status.className = 'dim';
+  status.textContent = closedCaret.trim() ? t().edit_hint : t().edit_create_hint;
+  let saved = d.text;
+  const dirty = on => { box._dirty = on; save.disabled = revert.disabled = !on; if(on) status.textContent = t().edit_unsaved; };
+  ta.oninput = () => dirty(ta.value !== saved);
+  revert.onclick = () => { ta.value = saved; dirty(false); status.textContent = t().edit_hint; };
+  async function doSave(){
+    if(save.disabled) return;
+    save.disabled = true; status.textContent = t().edit_saving;
+    try{
+      const r = await (await fetch('/api/content-save', {method:'POST', body: JSON.stringify({path, text: ta.value})})).json();
+      if(!r.ok){ alert(t().edit_failed + (r.error || t().error)); dirty(true); return; }
+      saved = ta.value; dirty(false); status.textContent = t().edit_saved + ' ✓';
+    } catch(e){ alert(t().edit_failed + e); dirty(true); }
+  }
+  save.onclick = doSave;
+  ta.onkeydown = e => { if((e.metaKey || e.ctrlKey) && e.key === 's'){ e.preventDefault(); doSave(); } };
+  box.onclick = e => e.stopPropagation();
+  bar.appendChild(save); bar.appendChild(revert); bar.appendChild(status);
+  box.appendChild(ta); box.appendChild(bar);
+  ta.focus();
+}
+async function uninstallPlugin(name, sc, el){
+  const label = sc.scope === 'user' ? t().scope_user : (sc.here ? t().scope_here : t().scope_other(baseName(sc.project)));
+  if(!confirm(t().uninstall_confirm(name, label))) return;
+  polling = false; el.style.opacity = .3;
+  try{
+    const r = await (await fetch('/api/plugin-uninstall', {method:'POST',
+      body: JSON.stringify({plugin: name, scope: sc.scope, project: sc.project || currentProjectDir})})).json();
+    if(!r.ok) alert(t().uninstall_failed + (r.error || t().error));
+  } catch(e){ alert(t().uninstall_failed + e); }
+  await rerender();
+}
+// 플러그인 설치 창. #app 밖에 있어서 3초 갱신이 다시 그려도 열린 채로 남는다.
+const im = {back: document.getElementById('installModal'), q: document.getElementById('imQuery'),
+            list: document.getElementById('imResults'), timer: null, seq: 0};
+function installOpen(){
+  document.getElementById('imTitle').textContent = t().install_title;
+  im.q.placeholder = t().install_search_ph;
+  document.getElementById('imScopeUser').textContent = t().install_scope_user;
+  document.getElementById('imScopeLocal').textContent = t().install_scope_local;
+  document.getElementById('imClose').textContent = t().install_close;
+  im.back.classList.add('open'); polling = false; im.q.focus(); installSearch();
+}
+function installClose(){ im.back.classList.remove('open'); polling = true; rerender(); }
+async function installSearch(){
+  const my = ++im.seq;
+  im.list.innerHTML = ''; const msg = document.createElement('div'); msg.className = 'empty'; msg.textContent = t().install_loading; im.list.appendChild(msg);
+  let d;
+  try{ d = await (await fetch('/api/plugin-catalog?q=' + encodeURIComponent(im.q.value))).json(); }
+  catch(e){ d = {ok: false, error: String(e)}; }
+  if(my !== im.seq) return;  // 더 새 검색이 있다
+  im.list.innerHTML = '';
+  if(!d.ok){ msg.textContent = t().error + d.error; im.list.appendChild(msg); return; }
+  if(!d.rows.length){ msg.textContent = t().install_none; im.list.appendChild(msg); return; }
+  for(const r of d.rows){
+    const row = document.createElement('div'); row.className = 'res';
+    const info = document.createElement('div'); info.className = 'info';
+    const nm = document.createElement('div'); nm.className = 'nm'; nm.textContent = r.id;
+    const ds = document.createElement('div'); ds.className = 'ds'; ds.textContent = r.desc;
+    info.appendChild(nm); info.appendChild(ds);
+    const go = document.createElement('button'); go.className = 'go'; go.textContent = t().install_btn;
+    go.onclick = async () => {
+      go.disabled = true; go.textContent = t().installing;
+      const scope = document.querySelector('input[name=imScope]:checked').value;
+      try{
+        const x = await (await fetch('/api/plugin-install', {method:'POST',
+          body: JSON.stringify({plugin: r.id, scope, project: currentProjectDir})})).json();
+        if(!x.ok){ alert(t().install_failed + (x.error || t().error)); go.disabled = false; go.textContent = t().install_btn; return; }
+        row.remove();
+      } catch(e){ alert(t().install_failed + e); go.disabled = false; go.textContent = t().install_btn; }
+    };
+    row.appendChild(info); row.appendChild(go); im.list.appendChild(row);
+  }
+}
+im.q.oninput = () => { clearTimeout(im.timer); im.timer = setTimeout(installSearch, 200); };
+document.getElementById('imClose').onclick = installClose;
+im.back.onclick = e => { if(e.target === im.back) installClose(); };
+document.addEventListener('keydown', e => { if(e.key === 'Escape' && im.back.classList.contains('open')) installClose(); });
+// 그룹 만들기·편집 창. 이름을 외워 입력하지 않고 목록에서 체크한다.
+const gm = {back: document.getElementById('groupModal'), name: document.getElementById('gmName'),
+            filter: document.getElementById('gmFilter'), list: document.getElementById('gmList'),
+            save: document.getElementById('gmSave'), cancel: document.getElementById('gmCancel'),
+            del: document.getElementById('gmDelete'), panel: null, editing: null, sel: new Set()};
+function groupOpen(panel, g){
+  gm.panel = panel; gm.editing = g ? g.name : null;
+  gm.sel = new Set((g ? g.members : []).map(m => m.kind + ':' + m.name));
+  document.getElementById('gmTitle').textContent = g ? t().group_edit_title(g.name) : t().group_new_title;
+  gm.name.placeholder = t().group_name_ph; gm.name.value = g ? g.name : ''; gm.name.disabled = !!g;
+  gm.filter.placeholder = t().group_filter_ph; gm.filter.value = '';
+  gm.save.textContent = t().group_save; gm.cancel.textContent = t().group_cancel; gm.del.textContent = t().group_delete;
+  gm.del.style.display = g ? '' : 'none';
+  gm.back.classList.add('open'); polling = false;
+  (g ? gm.filter : gm.name).focus(); groupRender();
+}
+function groupClose(){ gm.back.classList.remove('open'); polling = true; rerender(); }
+function groupRender(){
+  const q = gm.filter.value.trim().toLowerCase();
+  gm.list.innerHTML = '';
+  for(const [kind, all, label] of [['plugin', gm.panel.all_plugins, t().kind_plugin], ['skill', gm.panel.all_skills, t().kind_skill]]){
+    // 이미 든 구성원은 목록에 없어도(예: 지워진 것) 보이게 해서 체크를 풀 수 있게 한다.
+    const items = [...new Set([...all, ...[...gm.sel].filter(k => k.startsWith(kind + ':')).map(k => k.slice(kind.length + 1))])].sort();
+    const shown = items.filter(n => !q || n.toLowerCase().includes(q));
+    if(!shown.length) continue;
+    const head = document.createElement('div'); head.className = 'sec'; head.textContent = label; gm.list.appendChild(head);
+    for(const n of shown){
+      const row = document.createElement('label'); row.className = 'pick';
+      const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = gm.sel.has(kind + ':' + n);
+      cb.onchange = () => cb.checked ? gm.sel.add(kind + ':' + n) : gm.sel.delete(kind + ':' + n);
+      row.appendChild(cb); row.appendChild(document.createTextNode(n)); gm.list.appendChild(row);
+    }
+  }
+}
+async function groupSave(remove){
+  const name = (gm.editing || gm.name.value).trim();
+  if(!name){ alert(t().group_need_name); return; }
+  const pick = kind => [...gm.sel].filter(k => k.startsWith(kind + ':')).map(k => k.slice(kind.length + 1));
+  const plugins = remove ? [] : pick('plugin'), skills = remove ? [] : pick('skill');
+  if(!remove && !plugins.length && !skills.length){ alert(t().group_need_member); return; }
+  try{
+    const r = await (await fetch('/api/group-save', {method:'POST', body: JSON.stringify({group: name, plugins, skills})})).json();
+    if(!r.ok){ alert(t().group_update_failed + (r.error || t().error)); return; }
+  } catch(e){ alert(t().group_update_failed + e); return; }
+  groupClose();
+}
+gm.filter.oninput = groupRender;
+gm.save.onclick = () => groupSave(false);
+gm.cancel.onclick = groupClose;
+gm.del.onclick = () => { if(confirm(t().group_delete_confirm(gm.editing))) groupSave(true); };
+gm.back.onclick = e => { if(e.target === gm.back) groupClose(); };
+document.addEventListener('keydown', e => { if(e.key === 'Escape' && gm.back.classList.contains('open')) groupClose(); });
 async function toggle(name, enable, dotEl){
   polling = false; dotEl.classList.add('busy');
   try{
@@ -2311,7 +2688,8 @@ async function worktreeRequest(action, project, extra){
   return response.json();
 }
 function renderWorktrees(container, w, project){
-  if(!w) return;
+  // 워크트리가 없는(본 폴더 하나뿐인) 저장소에는 보여줄 게 없다. 자동 적용을 켜 둔 경우만 남긴다.
+  if(!w || (w.rows.length < 2 && !w.enabled && !w.query_failed)) return;
   const wrap = document.createElement('details'); wrap.style.cssText = 'margin:12px 0;padding:12px;border:1px solid var(--border);border-radius:8px';
   wrap.open = worktreeOpen;
   wrap.ontoggle = () => { worktreeOpen = wrap.open; };
@@ -2320,9 +2698,13 @@ function renderWorktrees(container, w, project){
   const note = (text) => { const n = document.createElement('div'); n.className = 'note'; n.textContent = text; wrap.appendChild(n); return n; };
   note(t().wt_intro);
   note(w.enabled ? t().wt_auto_active : t().wt_auto_inactive);
-  note(t().wt_poll(w.poll_seconds));
-  note(t().wt_session);
-  note(t().wt_claude);
+  const more = document.createElement('details'); more.style.cssText = 'margin:6px 0;font-size:12px';
+  const moreSum = document.createElement('summary'); moreSum.textContent = t().wt_more; moreSum.style.cursor = 'pointer';
+  more.appendChild(moreSum);
+  for(const text of [t().wt_poll(w.poll_seconds), t().wt_session, t().wt_claude]){
+    const n = document.createElement('div'); n.className = 'note'; n.textContent = text; more.appendChild(n);
+  }
+  wrap.appendChild(more);
   if(w.query_failed){ note(t().wt_query_failed); container.appendChild(wrap); return; }
   if(!w.can_apply) note(t().wt_root_only);
   const draft = worktreeDrafts[project] ||= {
@@ -2435,17 +2817,25 @@ function renderWorktrees(container, w, project){
 }
 
 async function tick(){
-  if(!polling) return;
+  if(!polling || document.hidden) return;
   const r = await fetch(stateUrl()); const d = await r.json();
+  const key = JSON.stringify([d.panels, activeTab, lang, selectedProject]);
+  const same = key === lastKey; lastKey = key;
   const upd = d.panels.find(p => p.panel === 'update');
   renderUpdate(upd);
   if(upd) renderFeedback(upd);
   renderSidebar(d.panels.find(p => p.known_projects) || {known_projects: [], project_dir: selectedProject});
   const app = document.getElementById('app');
+  const stamp = () => {
+    const pr = d.proc || {};
+    document.getElementById('tsText').textContent = t().updated + new Date(d.ts*1000).toLocaleTimeString() +
+      (pr.mb ? ` · ${t().usage(pr.mb, pr.cpu)}` : '');
+  };
+  if(same) return stamp();  // 내용이 같으면 DOM을 건드리지 않는다
   // 탭 안의 드롭다운이나 입력 칸을 쓰는 중이면 이번 갱신은 건너뛴다. 다시 그리면 그 요소가
   // 새것으로 바뀌어, 펼쳐 둔 "플러그인 또는 스킬 추가" 목록이 몇 초 만에 닫힌다.
   const busy = document.activeElement;
-  if(busy && app.contains(busy) && ['SELECT', 'INPUT', 'TEXTAREA'].includes(busy.tagName)) return;
+  if(busy && app.contains(busy) && ['SELECT', 'INPUT', 'TEXTAREA'].includes(busy.tagName)){ lastKey = ''; return; }
   app.innerHTML='';
   for(const p of d.panels){
     if(p.project_dir) currentProjectDir = p.project_dir;
@@ -2458,12 +2848,7 @@ async function tick(){
       const newBtn = document.createElement('span'); newBtn.className='card-action';
       newBtn.textContent = t().new_group;
       newBtn.title = t().new_group_tip;
-      newBtn.onclick = () => {
-        const name = prompt(t().new_group_name_prompt);
-        if(!name) return;
-        const first = prompt(t().new_group_first_prompt + (p.all_plugins||[]).join('\n'));
-        if(first) editGroup('add', name.trim(), first.trim(), 'plugin');
-      };
+      newBtn.onclick = () => groupOpen(p, null);
       headerRow.appendChild(h); headerRow.appendChild(newBtn);
       c.appendChild(headerRow);
       const legend = document.createElement('div'); legend.className='note'; legend.style.marginBottom='14px';
@@ -2496,63 +2881,33 @@ async function tick(){
             assignSet(g.name, apply);
           }
         };
+        const edit = document.createElement('span'); edit.className = 'btn'; edit.textContent = t().group_edit;
+        edit.onclick = () => groupOpen(p, g);
+        right.appendChild(edit);
         right.appendChild(apply);
         el.appendChild(left); el.appendChild(right);
         wrap.appendChild(el);
 
+        // 구성원은 한 줄 칩으로만 보여주고, 고치는 건 편집 창에서 한다.
+        const chips = document.createElement('div'); chips.className = 'chips';
         for(const m of g.members){
-          const mrow = document.createElement('div'); mrow.className='row sub';
-          const mleft = document.createElement('span'); mleft.className = 'sec-left';
-          const mdot = document.createElement('span'); mdot.className = 'dot ' + (m.on?'on':'off');
-          mdot.style.cursor = 'default';
+          const chip = document.createElement('span'); chip.className = 'chip' + (m.kind === 'skill' ? ' skill' : '');
+          const mdot = document.createElement('span'); mdot.className = 'dot ' + (m.on ? 'on' : 'off'); mdot.style.margin = '0';
           mdot.title = m.kind === 'plugin' ? t().member_plugin_tip : t().member_skill_tip;
-          mleft.appendChild(mdot);
-          const mn = document.createElement('span'); mn.textContent = m.name;
-          mleft.appendChild(mn);
-          const kind = document.createElement('span'); kind.className = 'comp';
-          kind.textContent = m.kind === 'plugin' ? t().kind_plugin : t().kind_skill;
-          mleft.appendChild(kind);
-          const rm = document.createElement('span'); rm.className='tag clickable danger'; rm.textContent=t().remove;
-          rm.title = t().remove_tip(m.name, g.name);
-          rm.onclick = () => { if(confirm(t().remove_confirm(m.name, g.name))) editGroup('remove', g.name, m.name, m.kind); };
-          mrow.appendChild(mleft); mrow.appendChild(rm);
-          wrap.appendChild(mrow);
+          chip.appendChild(mdot); chip.appendChild(document.createTextNode(m.name)); chips.appendChild(chip);
         }
-
-        const addRow = document.createElement('div'); addRow.className='row sub';
-        const addSel = document.createElement('select');
-        addSel.style.cssText='background:var(--bg);color:var(--dim);border:1px solid var(--border);border-radius:8px;padding:4px 8px;font-size:12px;max-width:100%';
-        const ph = document.createElement('option'); ph.value=''; ph.textContent=t().add_member_ph;
-        addSel.appendChild(ph);
-        const mk = (label, items, kind) => {
-          const grp = document.createElement('optgroup'); grp.label = label;
-          for(const it of items){
-            if(g.members.some(m => m.name === it && m.kind === kind)) continue;
-            const o = document.createElement('option'); o.value = kind + ':' + it; o.textContent = it;
-            grp.appendChild(o);
-          }
-          if(grp.children.length) addSel.appendChild(grp);
-        };
-        mk(t().kind_plugin, p.all_plugins||[], 'plugin');
-        mk(t().kind_skill, p.all_skills||[], 'skill');
-        addSel.onchange = () => {
-          if(!addSel.value) return;
-          const [kind, ...rest] = addSel.value.split(':');
-          addSel.blur();  // 포커스가 남아 있으면 render가 갱신을 건너뛰어, 추가한 줄이 안 보인다
-          editGroup('add', g.name, rest.join(':'), kind);
-        };
-        addRow.appendChild(addSel);
-        wrap.appendChild(addRow);
+        if(!g.members.length){ chips.className = 'note'; chips.textContent = t().group_empty; }
+        wrap.appendChild(chips);
         c.appendChild(wrap);
       }
 
     } else if(p.files){
       c.appendChild(h);
       for(const f of p.files){
-        const el = document.createElement('div'); el.className = 'row' + (f.exists ? ' clickable' : '');
+        const el = document.createElement('div'); el.className = 'row clickable';
         const left = document.createElement('span');
         const caret = document.createElement('span');
-        caret.textContent = f.exists ? '▸ ' : '';
+        caret.textContent = f.exists ? '▸ ' : '＋ ';
         left.appendChild(caret);
         left.insertAdjacentHTML('beforeend', `<span class="dot ${f.exists?'on':'off'}" style="cursor:default"></span>${f.name}<span class="tooltag">${f.tool}</span>`);
         const sizeSpan = document.createElement('span'); sizeSpan.className = 'dim';
@@ -2560,7 +2915,7 @@ async function tick(){
         el.appendChild(left); el.appendChild(sizeSpan);
         c.appendChild(el);
         const box = document.createElement('div'); box.className = 'content';
-        if(f.exists){ el.onclick = () => showContent(f.path, box, caret); }
+        el.onclick = () => showEditor(f.path, box, caret);
         c.appendChild(box);
       }
       if(p.truncated){
@@ -2579,7 +2934,7 @@ async function tick(){
         descSpan.textContent = (a.desc||'').slice(0,40);
         el.appendChild(left); el.appendChild(descSpan);
         const box = document.createElement('div'); box.className = 'content';
-        el.onclick = () => showContent(a.path, box, caret);
+        el.onclick = () => showEditor(a.path, box, caret);
         c.appendChild(el); c.appendChild(box);
       }
       if(!(p.agents||[]).length){
@@ -2594,7 +2949,12 @@ async function tick(){
       an.textContent = t().agents_note;
       c.appendChild(an);
     } else {
-      c.appendChild(h);
+      const headRow = document.createElement('div'); headRow.style.cssText = 'display:flex;align-items:center;justify-content:space-between;margin-bottom:6px';
+      h.style.margin = '0';
+      const installBtn = document.createElement('span'); installBtn.className = 'card-action';
+      installBtn.textContent = t().install_open; installBtn.onclick = installOpen;
+      headRow.appendChild(h); headRow.appendChild(installBtn);
+      c.appendChild(headRow);
       renderWorktrees(c, p.worktrees, p.project_dir);
       if(typeof p.loaded === 'number'){
         // 스킬은 이름과 설명이 세션 시작 때 전부 올라간다. 안 쓰는 것도 자리를 차지하므로,
@@ -2664,6 +3024,17 @@ async function tick(){
         if(isPlugin){
           const v = document.createElement('span'); v.className='tag'; v.textContent = 'v' + row.version;
           badges.appendChild(v);
+          // 공용(모든 프로젝트)인지 로컬(한 프로젝트 전용)인지. 바로 옆 ×로 그 범위의 설치만 지운다.
+          for(const sc of (row.scopes||[])){
+            const user = sc.scope === 'user';
+            const tag = document.createElement('span'); tag.className = 'tag ' + (user ? 'scope-user' : 'scope-local');
+            tag.textContent = user ? t().scope_user : (sc.here ? t().scope_here : t().scope_other(baseName(sc.project)));
+            tag.title = user ? t().scope_user_tip : (sc.here ? t().scope_here_tip : t().scope_other_tip + '\n' + sc.project);
+            const x = document.createElement('span'); x.className = 'x'; x.textContent = '×'; x.title = t().uninstall_tip;
+            x.onclick = e => { e.stopPropagation(); uninstallPlugin(row.name, sc, tag); };
+            tag.appendChild(x);
+            badges.appendChild(tag);
+          }
         }
         if(hasSkills){
           const c = document.createElement('span'); c.className='tag';
@@ -2800,9 +3171,7 @@ async function tick(){
     }
     app.appendChild(c);
   }
-  const pr = d.proc || {};
-  document.getElementById('tsText').textContent = t().updated + new Date(d.ts*1000).toLocaleTimeString() +
-    (pr.mb ? ` · ${t().usage(pr.mb, pr.cpu)}` : '');
+  stamp();
 }
 
 // 갱신 주기는 사용자가 정한다. 3초는 켜두고 보는 화면에는 과할 수 있고,
@@ -2832,6 +3201,7 @@ document.getElementById('period').onchange = e => {
   if(period > 0) tick();
 };
 renderPeriod();
+document.addEventListener('visibilitychange', () => { if(!document.hidden) tick(); });
 tick(); applyPeriod();
 </script></body></html>"""
 
@@ -2911,11 +3281,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(self.path).query)
             path = unquote((qs.get("path") or [""])[0])
             build_state()  # ensure READABLE_PATHS is fresh before checking
-            text, err = read_content(path)
+            text, err = ("", "") if path in CREATABLE_PATHS else read_content(path)
             if text is None:
                 self._send_json({"ok": False, "error": err}, 403)
             else:
                 self._send_json({"ok": True, "text": text})
+        elif self.path.startswith("/api/plugin-catalog"):
+            qs = parse_qs(urlparse(self.path).query)
+            rows, err = plugin_catalog(unquote((qs.get("q") or [""])[0]))
+            self._send_json({"ok": rows is not None, "rows": rows or [], "error": err})
         elif self.path == "/manifest.json":
             self.send_response(200)
             self.send_header("Content-Type", "application/manifest+json")
@@ -2936,7 +3310,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
+    def _same_origin(self):
+        """다른 웹사이트가 이 주소로 몰래 POST를 보내 파일을 고치거나 플러그인을 깔지 못하게 한다.
+        Origin은 브라우저와 앱 화면이 붙이고, 세션 훅(urllib)은 안 붙이므로 없으면 통과시킨다.
+        Host는 DNS 리바인딩을 막는다."""
+        host, origin = self.headers.get("Host", ""), self.headers.get("Origin")
+        return host.rsplit(":", 1)[0] in ("127.0.0.1", "localhost") and origin in (None, f"http://{host}")
+
     def do_POST(self):
+        if not self._same_origin():
+            return self._send_json({"ok": False, "error": "forbidden"}, 403)
         if self.path == "/api/worktrees":
             try:
                 payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
@@ -2996,6 +3379,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                    payload.get("member", "") or payload.get("plugin", ""),
                                    payload.get("kind", "plugin"))
             self._send_json({"ok": ok, "error": err})
+        elif self.path == "/api/group-save":
+            try:
+                payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            except Exception:
+                return self._send_json({"ok": False, "error": "bad request"}, 400)
+            ok, err = save_group(payload.get("group"), payload.get("plugins"), payload.get("skills"))
+            self._send_json({"ok": ok, "error": err})
         elif self.path == "/api/activate":
             length = int(self.headers.get("Content-Length", 0))
             try:
@@ -3024,6 +3414,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not ok:
                     errs.append(f"{n}: {err}")
             self._send_json({"ok": not errs, "error": "; ".join(errs[:3])})
+        elif self.path in ("/api/content-save", "/api/plugin-install", "/api/plugin-uninstall"):
+            try:
+                payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+            except Exception:
+                return self._send_json({"ok": False, "error": "bad request"}, 400)
+            if self.path == "/api/content-save":
+                ok, err = save_content(payload.get("path", ""), payload.get("text"))
+            else:
+                ok, err = plugin_change(self.path.rsplit("-", 1)[1], payload.get("plugin"), payload.get("scope"),
+                                        payload.get("project"))
+            self._send_json({"ok": ok, "error": err})
         elif self.path == "/api/pick-folder":
             path = pick_folder()
             self._send_json({"ok": path is not None, "path": path or ""})
