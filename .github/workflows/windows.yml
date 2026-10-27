@@ -1,0 +1,45 @@
+name: 윈도우 exe
+
+# PyInstaller는 크로스 컴파일을 못 해서 exe는 윈도우에서 만들어야 한다.
+# Actions 탭에서 "Run workflow"를 누르면 실행 결과 페이지의 Artifacts에 agent-hud.exe가 올라온다.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: exe 만들기
+        run: |
+          pip install pyinstaller pillow
+          pyinstaller --onefile --name agent-hud --icon docs/images/apple-touch-icon.png server.py
+
+      # 떠서 응답하는지와 상태 화면이 실패하지 않는지만 본다
+      - name: 떠서 응답하는지
+        shell: pwsh
+        run: |
+          $env:AGENT_HUD_NO_BROWSER = "1"
+          $p = Start-Process dist\agent-hud.exe -PassThru
+          $ok = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            try {
+              if ((Invoke-RestMethod http://127.0.0.1:41717/manifest.json).name -eq "Agent HUD") {
+                Invoke-RestMethod http://127.0.0.1:41717/api/state | Out-Null
+                $ok = $true; break
+              }
+            } catch {}
+            Start-Sleep 1
+          }
+          Stop-Process $p
+          if (-not $ok) { exit 1 }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-hud-windows
+          path: dist/agent-hud.exe

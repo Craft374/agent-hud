@@ -6,16 +6,23 @@ Extensibility: add a new panel by writing one function of shape
 Add a new plugin group by editing modes.json, or via the "+" button in the
 dashboard UI itself — no code change needed either way.
 """
-import json, os, re, urllib.request, http.server, socketserver, threading, webbrowser, sys, time, subprocess, shutil, resource, struct, zlib
+import json, os, re, urllib.request, http.server, socketserver, threading, webbrowser, sys, time, subprocess, shutil, struct, zlib
 from contextlib import contextmanager
-import fcntl
+try:
+    import fcntl, resource
+except ImportError:  # Windows. 둘 다 유닉스 전용이다
+    fcntl = resource = None
+    import msvcrt
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
 # 기본값은 스크립트 옆이다 -- 저장소에서 바로 실행하거나 install.sh로 복사해 쓰는 경우.
 # AGENT_HUD_HOME으로 옮길 수 있다. 패키지 매니저로 설치하면 코드가 업그레이드마다 통째로
 # 갈리는 곳에 놓이므로, 사용자 데이터를 거기 두면 그룹과 프로젝트 목록이 날아간다.
-TOOL_DIR = os.environ.get("AGENT_HUD_HOME") or os.path.dirname(os.path.abspath(__file__))
+# exe(PyInstaller)로 묶으면 __file__이 실행할 때마다 지워지는 임시 폴더 안이라, install.sh와 같은 자리를 쓴다.
+FROZEN = getattr(sys, "frozen", False)
+TOOL_DIR = (os.environ.get("AGENT_HUD_HOME") or
+            (os.path.join(CLAUDE_DIR, "tools", "agent-hud") if FROZEN else os.path.dirname(os.path.abspath(__file__))))
 os.makedirs(TOOL_DIR, exist_ok=True)
 PROJECTS_FILE = os.path.join(TOOL_DIR, "projects.json")
 MODES_FILE = os.path.join(TOOL_DIR, "modes.json")
@@ -39,7 +46,7 @@ _projects_lock = threading.Lock()
 def write_json(path, data, **kw):
     """다 쓴 뒤에 바꿔 끼운다. 쓰는 도중에 읽는 쪽이 반쯤 쓴 파일을 보지 않는다."""
     tmp = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, **kw)
     os.replace(tmp, path)
 
@@ -111,7 +118,7 @@ def read_json(path, default=None):
     # 읽는 파일은 전부 JSON 객체다. [] 처럼 형식만 맞는 값을 그대로 넘기면 뒤따르는 .get()에서
     # 화면 전체가 실패하므로, 객체가 아니면 못 읽은 것과 똑같이 취급한다.
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             return data
@@ -228,7 +235,8 @@ def start_in_background():
         subprocess.run([os.path.join(prefix, "bin", "brew"), "services", "start", "agent-hud"],
                        capture_output=True, timeout=120)
         return
-    subprocess.Popen([sys.executable, os.path.abspath(__file__)], start_new_session=True,
+    subprocess.Popen([sys.executable] if FROZEN else [sys.executable, os.path.abspath(__file__)],
+                     start_new_session=True, creationflags=getattr(subprocess, "DETACHED_PROCESS", 0),
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      env=dict(os.environ, AGENT_HUD_NO_BROWSER="1"))
 
@@ -725,11 +733,19 @@ def _worktree_transaction():
     # lose an exclusion or a newly saved default during automatic application.
     with _worktree_lock:
         with open(WORKTREE_FILE + ".lock", "a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            if fcntl:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            else:
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
             try:
                 yield
             finally:
-                fcntl.flock(lock, fcntl.LOCK_UN)
+                if fcntl:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                else:
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def local_path(path):
@@ -742,8 +758,9 @@ def local_path(path):
         return None
     path = os.path.abspath(path)
     for _ in range(40):
-        parts = path.split(os.sep)
-        cur = os.sep
+        drive, rest = os.path.splitdrive(path)  # 윈도우의 "C:"를 잃지 않는다. 맥에서는 drive가 ""
+        parts = rest.split(os.sep)
+        cur = drive + os.sep
         for i, part in enumerate(parts[1:], 1):
             cur = os.path.join(cur, part)
             if cur == "/Volumes" or cur.startswith("/Volumes/"):
@@ -924,6 +941,9 @@ def _create_skill_link(target, rel, name, source):
     state = _skill_path_state(target, rel, name, source)
     if state != "missing":
         return state
+    if os.name == "nt":
+        # ponytail: 윈도우는 dir_fd·O_NOFOLLOW가 없고 심볼릭 링크에 개발자 모드가 필요해 막아 둔다
+        return "blocked"
     fds = []
     try:
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -1326,7 +1346,7 @@ def _claude(args, cwd=None, timeout=300):
         return None, "claude command not found"
     try:
         r = subprocess.run([exe, "plugin", *args], cwd=cwd, env=env, capture_output=True, text=True,
-                           timeout=timeout, stdin=subprocess.DEVNULL)
+                           encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
     except Exception as e:
         return None, str(e)
     if r.returncode:
@@ -1422,7 +1442,7 @@ def _write_local(project_dir, data):
     path = os.path.join(project_dir, LOCAL_SETTINGS)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         return False, str(e)
@@ -1630,7 +1650,7 @@ def remove_stale_skill_denies(project_dir):
         if not perms:
             settings.pop("permissions")
         try:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"agent-hud: {path} 정리 실패: {e}", file=sys.stderr)
@@ -1651,6 +1671,8 @@ _last_cpu = [time.monotonic(), sum(os.times()[:2])]
 def proc_usage():
     """이 서버 자신의 메모리와 CPU. 폴링하는 도구라 스스로 얼마나 먹는지 보여야 한다.
     stdlib만 쓴다 -- 이걸 위해 psutil을 넣을 이유는 없다."""
+    if not resource:
+        return {"mb": None, "cpu": None}  # 윈도우. 화면은 mb가 없으면 사용량을 숨긴다
     rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     if sys.platform != "darwin":
         rss *= 1024  # 리눅스는 KB, macOS는 바이트로 준다
@@ -3551,6 +3573,11 @@ def main():
     if os.environ.get("CLAUDE_HUD_DISABLE") == "1":
         return
     global PROJECT_DIR
+    if os.name == "nt":
+        # 출력을 파일·DEVNULL로 돌리면 인코딩이 cp1252 같은 것이라 한국어 한 줄에 프로세스가 죽는다
+        for stream in (sys.stdout, sys.stderr):
+            if stream:
+                stream.reconfigure(errors="replace")
     argv = sys.argv[1:]
     if argv and argv[0] in ("groups", "apply", "worktrees", "-h", "--help", "help"):
         if argv[0] in ("-h", "--help", "help"):
@@ -3570,7 +3597,9 @@ def main():
     if len(sys.argv) > 2 and sys.argv[1] == "--register":
         PROJECT_DIR = os.path.abspath(sys.argv[2])
     registering = len(sys.argv) > 2 and sys.argv[1] == "--register"
-    opening = bool(argv) and argv[0] == "open"
+    # 윈도우 exe를 더블클릭했다. 떠 있으면 탭을 열고, 아니면 이 콘솔 창이 서버가 된다(창을 닫으면 꺼진다).
+    clicked = FROZEN and not argv
+    opening = clicked or (bool(argv) and argv[0] == "open")
     port = PORT
     url = f"http://127.0.0.1:{port}"
 
@@ -3594,7 +3623,7 @@ def main():
     if hud_alive(port):
         return hand_off()
 
-    if opening:
+    if opening and not clicked:
         # 꺼져 있으면 서버를 따로 띄우고, 응답할 때까지 기다렸다가 연다. 이 명령이 직접 서버가 되면
         # 터미널이나 에이전트의 셸을 붙잡고 끝나지 않고, 그 셸이 닫힐 때 대시보드도 같이 죽는다.
         start_in_background()
@@ -3606,9 +3635,11 @@ def main():
         print(f"agent-hud: the dashboard did not start. Is another program using port {port}?", file=sys.stderr)
         sys.exit(1)
 
-    register_project(PROJECT_DIR)
+    if not clicked:  # 더블클릭한 exe의 cwd는 exe가 있는 폴더라 프로젝트가 아니다
+        register_project(PROJECT_DIR)
     cleanup_known_projects()
-    socketserver.ThreadingTCPServer.allow_reuse_address = True
+    # 윈도우의 SO_REUSEADDR은 이미 쓰는 포트에도 붙게 해서, 아래의 "포트가 차 있으면 넘긴다"가 깨진다.
+    socketserver.ThreadingTCPServer.allow_reuse_address = os.name != "nt"
     # 다른 프로그램이 이 포트를 쓰고 있으면 옆 번호로 가지 않는다(위 PORT 설명).
     warned = False
     while True:
@@ -3630,6 +3661,8 @@ def main():
     threading.Thread(target=_worktree_apply_loop, daemon=True).start()
     if not os.environ.pop("AGENT_HUD_NO_BROWSER", None):
         webbrowser.open(url, new=0, autoraise=opening)
+    if clicked:
+        print(f"Agent HUD is running at {url}. Close this window to stop it.", flush=True)
     # keep process alive in background; parent hook detaches us
     while True:
         time.sleep(3600)

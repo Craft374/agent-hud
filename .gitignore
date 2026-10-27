@@ -34,3 +34,8 @@ assets/
 
 # 앱 빌드 산출물
 app/build/
+
+# PyInstaller(윈도우 exe) 산출물
+build/
+dist/
+*.spec
